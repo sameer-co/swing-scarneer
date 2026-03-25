@@ -10,8 +10,8 @@ import os
 # --- SECURE CONFIGURATION (Loaded from Railway Variables) ---
 # If testing locally, you can replace os.getenv() with your actual strings, 
 # but for Railway, set these in the 'Variables' tab.
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_LOCAL_TOKEN_HERE")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_LOCAL_CHAT_ID_HERE")
+TOKEN = os.getenv( '8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE', "YOUR_LOCAL_TOKEN_HERE")
+CHAT_ID = os.getenv('1950462171', "YOUR_LOCAL_CHAT_ID_HERE")
 
 # --- STRATEGY SETTINGS ---
 WATCHLIST = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ITC.NS", "SBI.NS"] 
