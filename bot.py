@@ -112,7 +112,7 @@ if __name__ == "__main__":
                         data = fetch_data(symbol, tf)
                         if data is not None:
                             process_strategy(symbol, data, tf)
-                        time.sleep(0.5) # Avoid rate limits
+                        time.sleep(1) # Avoid rate limits
                     except Exception as e:
                         print(f"Error on {symbol} ({tf}): {e}")
             
