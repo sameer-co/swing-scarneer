@@ -7,9 +7,9 @@ from datetime import datetime
 import pytz
 import os
 
-# --- SECURE CONFIG ---
-TOKEN = os.getenv('8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE')
-CHAT_ID = os.getenv('1950462171')
+# --- SECURE CONFIG (Direct Fix) ---
+TOKEN = '8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE'
+CHAT_ID = '1950462171'
 WATCHLIST_FILE = "watchlist.txt"
 
 # --- STRATEGY PARAMETERS ---
