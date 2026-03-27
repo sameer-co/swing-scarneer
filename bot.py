@@ -3,19 +3,23 @@ import pandas as pd
 import pandas_ta as ta
 import requests
 import time
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 import pytz
 import os
 
-# --- SECURE CONFIG (Direct Fix) ---
-TOKEN = '8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE'
-CHAT_ID = '1950462171'
+# --- SECURE CONFIG ---
+# Recommendation: In Railway, set these as Environment Variables
+TOKEN = os.getenv('TELEGRAM_TOKEN', '8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE')
+CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '1950462171')
 WATCHLIST_FILE = "watchlist.txt"
 
 # --- STRATEGY PARAMETERS ---
 RSI_PERIOD = 40
 WMA_PERIOD = 15
+# We only download '1h' and calculate the others locally to save API hits
 TIMEFRAMES = ['1h', '2h', '4h', '1d']
+BLACKLIST = ["WOCKHARDT.NS"] 
 
 # --- FUNCTIONS ---
 def send_telegram(message):
@@ -25,13 +29,9 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-def load_and_clean_watchlist():
-    """Reads watchlist.txt and ensures symbols have .NS suffix for India."""
+def load_watchlist():
     if not os.path.exists(WATCHLIST_FILE):
-        # Create a default if it doesn't exist
-        with open(WATCHLIST_FILE, "w") as f:
-            f.write("RELIANCE\nTCS\nINFY")
-        return ["RELIANCE.NS", "TCS.NS", "INFY.NS"]
+        return ["RELIANCE.NS", "TCS.NS"]
     
     with open(WATCHLIST_FILE, "r") as f:
         lines = f.read().splitlines()
@@ -39,46 +39,35 @@ def load_and_clean_watchlist():
     cleaned = []
     for s in lines:
         s = s.strip().upper()
-        if s:
-            # Add .NS if no suffix exists (Assumes NSE by default)
+        if s and s not in BLACKLIST:
             formatted = s if "." in s or "-" in s else f"{s}.NS"
             cleaned.append(formatted)
-    return list(set(cleaned)) # Remove duplicates
+    return list(set(cleaned))
 
-def is_market_open():
+def get_seconds_until_open():
+    """Calculates exactly how long to sleep until the next NSE opening."""
     tz = pytz.timezone('Asia/Kolkata')
     now = datetime.now(tz)
-    # Mon-Fri, 09:15 to 15:30 IST
-    if now.weekday() < 5:
-        start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        return start <= now <= end
-    return False
-
-def fetch_data(symbol, interval):
-    # Determine lookback based on interval
-    period = "60d" if "h" in interval else "2y"
-    yf_tf = "1h" if "h" in interval else "1d"
     
-    df = yf.download(symbol, period=period, interval=yf_tf, progress=False)
-    if df.empty: return None
-
-    # Handle Multi-Index columns (yfinance v0.2.40+)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    # Resampling for 2h/4h
-    if interval == '2h':
-        df = df.resample('2h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
-    elif interval == '4h':
-        df = df.resample('4h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+    # Target is 09:15 AM
+    target = now.replace(hour=9, minute=15, second=0, microsecond=0)
     
-    return df
+    # If it's already past 15:30, move target to tomorrow
+    if now.time() >= datetime.strptime("15:30", "%H:%M").time():
+        target += timedelta(days=1)
+    
+    # If target is Sat/Sun, move to Monday
+    while target.weekday() > 4:
+        target += timedelta(days=1)
+        
+    return (target - now).total_seconds()
 
-def process_strategy(symbol, df, tf):
-    # Calculate RSI(40)
+def process_logic(symbol, df, tf):
+    """The math engine for RSI Crossover."""
+    if df.empty or len(df) < (RSI_PERIOD + WMA_PERIOD):
+        return
+
     df['RSI'] = ta.rsi(df['Close'], length=RSI_PERIOD)
-    # Calculate WMA(15) of the RSI
     df['WMA_RSI'] = ta.wma(df['RSI'], length=WMA_PERIOD)
     
     df = df.dropna(subset=['WMA_RSI'])
@@ -87,7 +76,6 @@ def process_strategy(symbol, df, tf):
     curr = df.iloc[-1]
     prev = df.iloc[-2]
 
-    # BULLISH CROSSOVER (RSI crosses ABOVE WMA)
     if prev['RSI'] <= prev['WMA_RSI'] and curr['RSI'] > curr['WMA_RSI']:
         msg = (f"🚀 *BULLISH CROSSOVER*\n"
                f"*Symbol:* `{symbol}`\n"
@@ -95,32 +83,69 @@ def process_strategy(symbol, df, tf):
                f"*RSI:* {curr['RSI']:.2f}\n"
                f"*WMA:* {curr['WMA_RSI']:.2f}")
         send_telegram(msg)
-        print(f"Alert Sent: {symbol} {tf} Bullish")
+        print(f"✅ Alert Sent: {symbol} {tf}")
 
-# --- MAIN LOOP ---
+def run_bulk_scan():
+    watchlist = load_watchlist()
+    print(f"📦 Starting Bulk Fetch for {len(watchlist)} symbols...")
+    
+    # Adding jitter to avoid static fingerprinting
+    time.sleep(random.randint(5, 15))
+
+    try:
+        # Download 1h data for everyone in ONE request
+        # 60d period is enough to resample into 1d, 4h, 2h
+        data = yf.download(watchlist, period="60d", interval="1h", group_by='ticker', progress=False)
+    except Exception as e:
+        print(f"Critical Download Error: {e}")
+        return
+
+    for symbol in watchlist:
+        try:
+            # Grab the specific data for this ticker
+            ticker_df = data[symbol].dropna(how='all') if len(watchlist) > 1 else data.dropna(how='all')
+            
+            if ticker_df.empty: continue
+
+            # Resample locally (No extra API calls!)
+            for tf in TIMEFRAMES:
+                if tf == '1h':
+                    work_df = ticker_df.copy()
+                elif tf == '2h':
+                    work_df = ticker_df.resample('2h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+                elif tf == '4h':
+                    work_df = ticker_df.resample('4h').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+                elif tf == '1d':
+                    work_df = ticker_df.resample('D').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}).dropna()
+                
+                process_logic(symbol, work_df, tf)
+                
+        except Exception as e:
+            print(f"Skipping {symbol} due to error: {e}")
+
+# --- MAIN ENGINE ---
 if __name__ == "__main__":
-    print("✅ Bot Initialization Complete.")
+    print("🤖 Trading Bot Initialized. Monitoring NSE...")
+    tz = pytz.timezone('Asia/Kolkata')
     
     while True:
-        if is_market_open():
-            watchlist = load_and_clean_watchlist()
-            print(f"Scanning {len(watchlist)} symbols...")
+        now = datetime.now(tz)
+        
+        # Check if Market is Open (Mon-Fri, 09:15 - 15:30)
+        is_weekday = now.weekday() < 5
+        is_hours = datetime.strptime("09:15", "%H:%M").time() <= now.time() <= datetime.strptime("15:30", "%H:%M").time()
+        
+        if is_weekday and is_hours:
+            start_mark = time.time()
+            run_bulk_scan()
             
-            for symbol in watchlist:
-                for tf in TIMEFRAMES:
-                    try:
-                        data = fetch_data(symbol, tf)
-                        if data is not None:
-                            process_strategy(symbol, data, tf)
-                        time.sleep(1) # Avoid rate limits
-                    except Exception as e:
-                        print(f"Error on {symbol} ({tf}): {e}")
-            
-            print("Scan finished. Waiting 15m.")
-            time.sleep(900)
+            # Wait 15 minutes before next scan
+            elapsed = time.time() - start_mark
+            sleep_time = max(900 - elapsed, 60) 
+            print(f"☕ Scan complete in {elapsed:.1f}s. Next scan in {sleep_time/60:.1f}m.")
+            time.sleep(sleep_time)
         else:
-            # Market Closed Logic
-            tz = pytz.timezone('Asia/Kolkata')
-            now = datetime.now(tz)
-            print(f"Market Closed ({now.strftime('%H:%M')}). Checking in 10m...")
-            time.sleep(600)
+            # Deep Sleep until next market open
+            seconds_to_wait = get_seconds_until_open()
+            print(f"🌙 Market Closed. Sleeping for {seconds_to_wait/3600:.2f} hours...")
+            time.sleep(seconds_to_wait)
