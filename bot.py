@@ -1,42 +1,80 @@
-import yfinance as yf
-import pandas as pd
-import pandas_ta as ta
-import requests
-import time
-import random
-from datetime import datetime, timedelta
-import pytz
+"""
+RSI(40) × WMA(15) Stock Scanner
+Platform : Railway (Serverless mode)
+Memory   : One symbol at a time, explicit del + gc after each
+"""
+
+import gc
 import os
+import random
+import threading
+import time
+from datetime import datetime, timedelta, time as dtime
 
-# --- CONFIG ---
-TOKEN   = os.getenv('TELEGRAM_TOKEN',  '8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '1950462171')
-WATCHLIST_FILE = "watchlist.txt"
+import pytz
+import requests
+from flask import Flask, jsonify
 
-# --- STRATEGY PARAMETERS ---
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+TOKEN          = os.getenv('TELEGRAM_TOKEN',  '8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE')
+CHAT_ID        = os.getenv('TELEGRAM_CHAT_ID', '1950462171')
+WATCHLIST_FILE = os.getenv('WATCHLIST_FILE',  'watchlist.txt')
+PORT           = int(os.getenv('PORT', 8080))   # Railway injects PORT automatically
+
 RSI_PERIOD = 40
 WMA_PERIOD = 15
-TIMEFRAMES = ['2h', '4h', '1d']          # 1h removed — biggest memory saver
-BLACKLIST  = ["WOCKHARDT.NS"]
+TIMEFRAMES = ['2h', '4h', '1d']
+BLACKLIST  = {'WOCKHARDT.NS'}
+IST        = pytz.timezone('Asia/Kolkata')
 
-# --- STATE ---
-# last_alerts format: {"TCS.NS_2h": datetime}  — cleared at midnight each day
-last_alerts: dict = {}
+# ── SHARED STATE ──────────────────────────────────────────────────────────────
+_lock       = threading.Lock()
+last_alerts : dict = {}
+_status     : dict = {
+    "last_scan":    "never",
+    "next_scan":    "09:20 IST Mon-Fri",
+    "last_summary": "—",
+}
 
-# ── HELPERS ──────────────────────────────────────────────────────────────────
+# ── FLASK ─────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
 
-def send_telegram(message: str) -> None:
+@app.route('/health')
+def health():
+    """Railway pings this — keeps process alive during market hours."""
+    return jsonify({"ok": True, "ist": datetime.now(IST).strftime('%H:%M:%S')}), 200
+
+@app.route('/status')
+def status():
+    with _lock:
+        s = dict(_status)
+        s["dedup_keys"] = len(last_alerts)
+    return jsonify(s), 200
+
+@app.route('/')
+def root():
+    return (
+        "<h3>Scanner ✅</h3>"
+        "<a href='/health'>health</a> | "
+        "<a href='/status'>status</a>"
+    )
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+
+def send_telegram(msg: str) -> None:
     url = (
         f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        f"?chat_id={CHAT_ID}&text={requests.utils.quote(message)}&parse_mode=Markdown"
+        f"?chat_id={CHAT_ID}"
+        f"&text={requests.utils.quote(msg)}"
+        f"&parse_mode=Markdown"
     )
     try:
         requests.get(url, timeout=10)
     except Exception as e:
-        print(f"[Telegram Error] {e}")
+        print(f"[TG Error] {e}")
 
 
-def load_watchlist() -> list[str]:
+def load_watchlist() -> list:
     if not os.path.exists(WATCHLIST_FILE):
         return ["RELIANCE.NS", "TCS.NS"]
     with open(WATCHLIST_FILE) as f:
@@ -48,115 +86,122 @@ def load_watchlist() -> list[str]:
     })
 
 
-def next_market_open() -> float:
-    """Return seconds until 9:15 AM IST on the next trading day."""
-    tz  = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(tz)
-    target = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    if now.time() >= target.time():
-        target += timedelta(days=1)
-    while target.weekday() > 4:          # skip weekends
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
+def ist_now() -> datetime:
+    return datetime.now(IST)
 
 
-# ── CORE SCAN ─────────────────────────────────────────────────────────────────
+def is_market_open() -> bool:
+    now = ist_now()
+    if now.weekday() > 4:
+        return False
+    return dtime(9, 15) <= now.time() <= dtime(15, 30)
 
-def run_scan() -> None:
+
+# ── PER-SYMBOL SCAN (max memory efficiency) ───────────────────────────────────
+
+def scan_symbol(symbol: str, hits: dict) -> None:
     """
-    Download data once, resample, check signals for every symbol × TF.
-    Collect hits per timeframe, then send at most 3 Telegram messages.
+    Download + process one symbol. All dataframes deleted immediately after use.
+    yfinance and pandas_ta imported inside function so they are
+    not resident in memory during the long sleep between scans.
     """
-    watchlist = load_watchlist()
-    print(f"[Scan] {datetime.now().strftime('%H:%M')} — {len(watchlist)} symbols")
+    import yfinance as yf
+    import pandas_ta as ta
 
-    # Small random jitter so Railway doesn't see perfectly timed bursts
-    time.sleep(random.randint(1, 3))
-
-    # ── 1. Download 1h data (used as base for resampling) ──
+    raw = None
     try:
         raw = yf.download(
-            watchlist,
-            period="30d",              # 30d is enough for RSI(40) on daily
+            symbol,
+            period="30d",
             interval="1h",
-            group_by='ticker',
             progress=False,
-            threads=True,
+            auto_adjust=True,
         )
-    except Exception as e:
-        print(f"[Download Error] {e}")
-        return
 
-    # ── 2. Per-timeframe signal buckets ──
-    hits: dict[str, list[str]] = {tf: [] for tf in TIMEFRAMES}
+        if raw is None or raw.empty:
+            return
 
-    for symbol in watchlist:
-        try:
-            # Extract single-symbol DataFrame
-            df_1h = (raw[symbol] if len(watchlist) > 1 else raw).dropna(how='all')
-            if df_1h.empty:
+        # Flatten MultiIndex columns if present
+        if hasattr(raw.columns, 'levels'):
+            raw.columns = raw.columns.get_level_values(0)
+        raw.columns = [str(c) for c in raw.columns]
+
+        for tf in TIMEFRAMES:
+            rule = {'2h': '2h', '4h': '4h', '1d': 'D'}[tf]
+
+            work = raw.resample(rule).agg({
+                'Open':   'first',
+                'High':   'max',
+                'Low':    'min',
+                'Close':  'last',
+                'Volume': 'sum',
+            }).dropna()
+
+            if len(work) < (RSI_PERIOD + WMA_PERIOD + 2):
+                del work
                 continue
 
-            for tf in TIMEFRAMES:
-                # ── 3. Resample ──
-                if tf == '2h':
-                    work = df_1h.resample('2h').agg(
-                        {'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}
-                    ).dropna()
-                elif tf == '4h':
-                    work = df_1h.resample('4h').agg(
-                        {'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}
-                    ).dropna()
-                else:  # 1d
-                    work = df_1h.resample('D').agg(
-                        {'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'}
-                    ).dropna()
+            work = work.copy()
+            work['RSI']     = ta.rsi(work['Close'], length=RSI_PERIOD)
+            work['WMA_RSI'] = ta.wma(work['RSI'],   length=WMA_PERIOD)
+            work.dropna(subset=['WMA_RSI'], inplace=True)
 
-                if len(work) < (RSI_PERIOD + WMA_PERIOD + 2):
+            if len(work) < 2:
+                del work
+                continue
+
+            curr, prev = work.iloc[-1], work.iloc[-2]
+            crossover  = (
+                prev['RSI'] <= prev['WMA_RSI'] and
+                curr['RSI'] >  curr['WMA_RSI']
+            )
+
+            close_price = float(curr['Close'])
+            del work
+
+            if not crossover:
+                continue
+
+            key = f"{symbol}_{tf}"
+            now = datetime.now()
+            with _lock:
+                last_hit = last_alerts.get(key)
+                if last_hit and (now - last_hit) < timedelta(hours=20):
                     continue
-
-                # ── 4. Indicators ──
-                work = work.copy()
-                work['RSI']     = ta.rsi(work['Close'], length=RSI_PERIOD)
-                work['WMA_RSI'] = ta.wma(work['RSI'],   length=WMA_PERIOD)
-                work.dropna(subset=['WMA_RSI'], inplace=True)
-
-                if len(work) < 2:
-                    continue
-
-                curr, prev = work.iloc[-1], work.iloc[-2]
-
-                # ── 5. Signal check ──
-                crossover = (
-                    prev['RSI'] <= prev['WMA_RSI'] and
-                    curr['RSI'] >  curr['WMA_RSI']
-                )
-                if not crossover:
-                    continue
-
-                # ── 6. De-duplicate (20-hour window) ──
-                key = f"{symbol}_{tf}"
-                now = datetime.now()
-                if key in last_alerts and (now - last_alerts[key]) < timedelta(hours=20):
-                    continue
-
                 last_alerts[key] = now
-                price = f"₹{curr['Close']:.2f}"
-                hits[tf].append(f"`{symbol}` @ {price}")
-                print(f"  Signal: {key} @ {price}")
 
-        except Exception:
-            continue
+            hits[tf].append(f"`{symbol}` @ ₹{close_price:.2f}")
+            print(f"  Signal: {key} @ ₹{close_price:.2f}")
 
-        finally:
-            # Free memory after each symbol
-            del df_1h
+    except Exception as e:
+        print(f"  [Err] {symbol}: {e}")
+    finally:
+        if raw is not None:
+            del raw
+        gc.collect()
 
-    # Free raw download
-    del raw
 
-    # ── 7. Send one message per timeframe (always — signals or none) ──
-    scan_time = datetime.now().strftime('%d %b %H:%M')
+# ── FULL SCAN ─────────────────────────────────────────────────────────────────
+
+def run_scan() -> None:
+    if not is_market_open():
+        print(f"[Skip] Market closed — {ist_now().strftime('%H:%M IST')}")
+        return
+
+    watchlist = load_watchlist()
+    scan_time = ist_now().strftime('%d %b %H:%M')
+    print(f"[Scan] {scan_time} — {len(watchlist)} symbols")
+
+    hits: dict = {tf: [] for tf in TIMEFRAMES}
+
+    for i, symbol in enumerate(watchlist):
+        time.sleep(random.uniform(0.3, 0.8))   # gentle rate limiting
+        scan_symbol(symbol, hits)
+        if i % 10 == 0:
+            gc.collect()
+
+    # Send one Telegram message per timeframe
+    summary_parts = []
     for tf, signals in hits.items():
         if signals:
             lines = "\n".join(f"  {s}" for s in signals)
@@ -167,91 +212,66 @@ def run_scan() -> None:
                 f"━━━━━━━━━━━━━━━\n"
                 f"_Scan: {scan_time} IST_"
             )
+            summary_parts.append(f"{tf}: {len(signals)} hit(s)")
         else:
             msg = (
                 f"📭 *No signals — {tf.upper()}*\n"
                 f"_Scan: {scan_time} IST_"
             )
+            summary_parts.append(f"{tf}: none")
         send_telegram(msg)
 
+    summary = " | ".join(summary_parts)
+    print(f"[Done] {summary}")
 
-# ── SCHEDULER ────────────────────────────────────────────────────────────────
+    with _lock:
+        _status["last_scan"]    = scan_time
+        _status["last_summary"] = summary
 
-def ist_now() -> datetime:
-    return datetime.now(pytz.timezone('Asia/Kolkata'))
-
-
-def wait_until(h: int, m: int) -> None:
-    """Block until HH:MM IST today (or skip if already past)."""
-    tz     = pytz.timezone('Asia/Kolkata')
-    now    = datetime.now(tz)
-    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    diff   = (target - now).total_seconds()
-    if diff > 0:
-        print(f"  Waiting {diff/60:.1f} min until {h:02d}:{m:02d}…")
-        time.sleep(diff)
+    gc.collect()
 
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+def midnight_reset() -> None:
+    with _lock:
+        last_alerts.clear()
+    gc.collect()
+    print(f"[Reset] last_alerts cleared — {ist_now().date()}")
+
+
+# ── SCHEDULER ─────────────────────────────────────────────────────────────────
+
+def start_scheduler() -> None:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
+    scheduler = BackgroundScheduler(timezone=IST)
+
+    slots = [(9,20),(10,15),(11,15),(12,15),(13,15),(14,15),(15,15)]
+    for h, m in slots:
+        scheduler.add_job(
+            run_scan,
+            CronTrigger(day_of_week='mon-fri', hour=h, minute=m, timezone=IST),
+            id=f"scan_{h:02d}{m:02d}",
+            misfire_grace_time=300,   # fire up to 5 min late after cold-start
+            replace_existing=True,
+        )
+
+    scheduler.add_job(
+        midnight_reset,
+        CronTrigger(hour=0, minute=1, timezone=IST),
+        id="midnight_reset",
+        replace_existing=True,
+    )
+
+    scheduler.start()
+    print(f"[Scheduler] {len(scheduler.get_jobs())} jobs registered")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Scanner started.")
-
-    while True:
-        now = ist_now()
-
-        # ── Weekend / after-hours: sleep until next open ──
-        if now.weekday() > 4:
-            secs = next_market_open()
-            print(f"Weekend. Sleeping {secs/3600:.1f} h until market open.")
-            time.sleep(secs)
-            continue
-
-        market_open  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-
-        if now < market_open:
-            secs = (market_open - now).total_seconds()
-            print(f"Pre-market. Sleeping {secs/60:.1f} min.")
-            time.sleep(secs)
-            continue
-
-        if now > market_close:
-            secs = next_market_open()
-            print(f"Market closed. Sleeping {secs/3600:.1f} h until next open.")
-            time.sleep(secs)
-            continue
-
-        # ── It is a trading day inside market hours ──
-
-        # ── Opening scan at 9:20 (wait for gap to settle) ──
-        wait_until(9, 20)
-        print("[9:20] Opening scan")
-        run_scan()
-
-        # ── Hourly scans: 10:15, 11:15, 12:15, 13:15, 14:15, 15:15 ──
-        scan_times = [(10,15),(11,15),(12,15),(13,15),(14,15),(15,15)]
-        for h, m in scan_times:
-            now = ist_now()
-            target = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            if now > target:
-                continue       # already past this slot today — skip
-            wait_until(h, m)
-            print(f"[{h:02d}:{m:02d}] Scan")
-            run_scan()
-
-        # ── All scans done for today ──
-        # Sleep until midnight, clear alerts, then sleep until next open
-        tz      = pytz.timezone('Asia/Kolkata')
-        now_ist = datetime.now(tz)
-        midnight = now_ist.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-        secs_to_midnight = (midnight - now_ist).total_seconds()
-        print(f"All scans done. Sleeping {secs_to_midnight/3600:.1f} h until midnight reset.")
-        time.sleep(secs_to_midnight)
-
-        last_alerts.clear()
-        print(f"[Midnight Reset] last_alerts cleared for {midnight.date()}")
-
-        secs = next_market_open()
-        print(f"Sleeping {secs/3600:.1f} h until market open.")
-        time.sleep(secs)
+    print("=== RSI×WMA Scanner starting ===")
+    start_scheduler()
+    # Flask runs in main thread — keeps Railway process alive via /health pings
+    # use_reloader=False prevents APScheduler from starting twice
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False, debug=False)
