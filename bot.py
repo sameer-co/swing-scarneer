@@ -1,4 +1,3 @@
-
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
@@ -17,7 +16,7 @@ WATCHLIST_FILE = "watchlist.txt"
 # --- STRATEGY PARAMETERS ---
 RSI_PERIOD = 40
 WMA_PERIOD = 15
-TIMEFRAMES = ['1h', '2h', '4h', '1d']
+TIMEFRAMES = ['2h', '4h']
 BLACKLIST = ["WOCKHARDT.NS"] 
 
 # --- MEMORY & SUMMARY (New) ---
