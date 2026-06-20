@@ -1,362 +1,526 @@
-import yfinance as yf
-import pandas as pd
-import pandas_ta as ta
-import requests
-import time
-import random
-import gc
-import logging
-from datetime import datetime, timedelta
-import pytz
+#!/usr/bin/env python3
+"""
+SOLUSDC 1-Minute RSI(28)/EMA(13) Crossover Backtest
+=====================================================
+
+Strategy
+--------
+- Indicator: RSI(28) and a 13-period EMA of that RSI line.
+- Entry (LONG ONLY): when RSI(28) crosses ABOVE its 13 EMA -> BUY at the
+  close of the signal candle (next-bar-open execution is also supported,
+  see EXECUTION_MODE below).
+- Stop Loss: low of the candle immediately BEFORE the signal/trigger candle.
+- Take Profit: entry + 2.2 * (entry - stop_loss)   [Risk:Reward = 1 : 2.2]
+- Costs: 0.06% total round-trip cost (entry + exit combined), applied as a
+  simple percentage drag on the trade's gross return.
+- Position sizing: FULL ACCOUNT, COMPOUNDING (spot-style, no leverage,
+  no shorting, one position open at a time). Every trade risks 100% of
+  current equity (you chose this explicitly to see compounding behavior --
+  see the warning printed at runtime).
+- Account starts at $100.
+
+Data
+----
+Binance public REST API, no API key required:
+  GET https://api.binance.com/api/v3/klines
+Symbol: SOLUSDC, Interval: 1m, Range: last 365 days (auto, paginated).
+Data is cached to a local CSV (solusdc_1m_1y.csv) so re-runs don't
+re-download ~525,600 candles every time.
+
+Dependencies
+------------
+This script installs any missing dependencies itself on first run
+(pandas, numpy, requests). No manual `pip install` needed.
+
+Usage
+-----
+    python3 solusdc_rsi_ema_backtest.py
+
+Optional flags:
+    --refresh           Force re-download of data (ignore cache)
+    --execution close   Enter at signal-candle CLOSE (default)
+    --execution next    Enter at NEXT candle OPEN (more realistic, avoids lookahead)
+"""
+
+import sys
+import subprocess
+import importlib
+import argparse
 import os
+import time
+from datetime import datetime, timedelta, timezone
 
-# --- LOGGING SETUP ---
-logging.basicConfig(
-    filename="scanner.log",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-log = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# 0. SELF-INSTALLING DEPENDENCIES
+# ---------------------------------------------------------------------------
+REQUIRED = {
+    "pandas": "pandas",
+    "numpy": "numpy",
+    "requests": "requests",
+}
 
-# --- SECURE CONFIG ---
-TOKEN   = os.getenv('TELEGRAM_TOKEN',   '8050135427:AAFNQYFpU8lMQ-reJlvLnPYFKc8pyPrHblE')
-CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '1950462171')
-WATCHLIST_FILE = "watchlist.txt"
-
-# --- STRATEGY PARAMETERS ---
-RSI_PERIOD = 40
-WMA_PERIOD = 15
-TIMEFRAMES = ['2h', '4h']
-BLACKLIST  = {"WOCKHARDT.NS"}
-
-# --- FIXED SCAN SCHEDULE (IST) ---
-# First scan at 9:20, then every hour from 10:15 to 15:15
-SCAN_TIMES: list[str] = (
-    ["09:20"] +
-    [f"{h:02d}:15" for h in range(10, 16)]   # 10:15, 11:15 … 15:15
-)
-
-# --- STATE ---
-last_alerts:       dict[str, datetime] = {}
-daily_summary:     list[str]           = []
-_watchlist_mtime:  float               = 0.0
-_cached_watchlist: list[str]           = []
-last_heartbeat:    datetime            = datetime.min
-
-
-# ─────────────────────────── HELPERS ────────────────────────────
-
-def send_telegram(message: str) -> None:
-    url = (
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        f"?chat_id={CHAT_ID}&text={message}&parse_mode=Markdown"
-    )
-    try:
-        requests.get(url, timeout=10)
-    except Exception as e:
-        log.error(f"Telegram send failed: {e}")
-
-
-def load_watchlist() -> list[str]:
-    """Hot-reload: re-reads file only when it has been modified on disk."""
-    global _watchlist_mtime, _cached_watchlist
-
-    if not os.path.exists(WATCHLIST_FILE):
-        return ["RELIANCE.NS", "TCS.NS"]
-
-    mtime = os.path.getmtime(WATCHLIST_FILE)
-    if mtime == _watchlist_mtime:
-        return _cached_watchlist          # unchanged — return cache
-
-    log.info("Watchlist file changed — reloading.")
-    with open(WATCHLIST_FILE) as f:
-        lines = f.read().splitlines()
-
-    symbols = set()
-    for s in lines:
-        s = s.strip().upper()
-        if not s or s in BLACKLIST:
-            continue
-        symbols.add(s if "." in s else f"{s}.NS")
-
-    _cached_watchlist = list(symbols)
-    _watchlist_mtime  = mtime
-    return _cached_watchlist
-
-
-def prune_old_alerts() -> None:
-    """Keep last_alerts dict small — drop entries older than 25 h."""
-    cutoff = datetime.now() - timedelta(hours=25)
-    stale  = [k for k, v in last_alerts.items() if v < cutoff]
-    for k in stale:
-        del last_alerts[k]
-
-
-def get_next_scan_time(tz: pytz.BaseTzInfo) -> datetime:
-    """Return the next scheduled scan as a timezone-aware datetime."""
-    now = datetime.now(tz)
-    for t in SCAN_TIMES:
-        h, m = map(int, t.split(":"))
-        candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        if candidate > now:
-            return candidate
-    # All today's slots passed — first slot tomorrow (skip weekends)
-    tomorrow = now + timedelta(days=1)
-    while tomorrow.weekday() > 4:
-        tomorrow += timedelta(days=1)
-    h, m = map(int, SCAN_TIMES[0].split(":"))
-    return tomorrow.replace(hour=h, minute=m, second=0, microsecond=0)
-
-
-# ─────────────────────────── DOWNLOAD ───────────────────────────
-
-RESAMPLE_MAP = {'2h': '2h', '4h': '4h', '1d': 'D'}
-AGGS         = {'Open': 'first', 'High': 'max', 'Low': 'min',
-                'Close': 'last', 'Volume': 'sum'}
-MAX_RETRIES  = 3
-RETRY_DELAY  = 10   # seconds between retries
-
-
-def download_with_retry(watchlist: list[str]) -> dict | None:
-    """
-    Download 1 h OHLCV data with up to MAX_RETRIES attempts.
-    Always returns a plain dict {symbol: DataFrame} regardless of
-    watchlist size — fixes the single-symbol flat-column bug.
-    """
-    for attempt in range(1, MAX_RETRIES + 1):
+def ensure_dependencies():
+    missing = []
+    for import_name, pip_name in REQUIRED.items():
         try:
-            raw = yf.download(
-                watchlist,
-                period="60d", interval="1h",
-                group_by='ticker', progress=False,
-                threads=True, auto_adjust=True
-            )
-            if raw is None or raw.empty:
-                raise ValueError("Empty DataFrame returned")
+            importlib.import_module(import_name)
+        except ImportError:
+            missing.append(pip_name)
+    if missing:
+        print(f"[setup] Installing missing dependencies: {', '.join(missing)} ...")
+        cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + missing
+        # --break-system-packages is needed on some externally-managed Python
+        # installs (PEP 668, e.g. recent Debian/Ubuntu). Try normal install
+        # first, fall back if it fails.
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            cmd_alt = cmd + ["--break-system-packages"]
+            result2 = subprocess.run(cmd_alt, capture_output=True, text=True)
+            if result2.returncode != 0:
+                print("[setup] ERROR installing dependencies:")
+                print(result.stderr)
+                print(result2.stderr)
+                sys.exit(1)
+        print("[setup] Dependencies installed.")
 
-            # Normalise to dict regardless of single vs multi symbol
-            if len(watchlist) == 1:
-                result = {watchlist[0]: raw}
+ensure_dependencies()
+
+import numpy as np
+import pandas as pd
+import requests
+
+# ---------------------------------------------------------------------------
+# 1. CONFIG
+# ---------------------------------------------------------------------------
+SYMBOL = "SOLUSDC"
+INTERVAL = "1m"
+DAYS_BACK = 365
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "solusdc_1m_1y.csv")
+
+RSI_LEN = 28
+EMA_LEN = 13
+RR_MULTIPLE = 2.2          # target = entry + RR_MULTIPLE * risk
+ROUND_TRIP_COST_PCT = 0.06 / 100.0   # 0.06% total (entry+exit combined)
+STARTING_EQUITY = 100.0
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+MAX_LIMIT = 1000  # Binance max candles per request
+
+
+# ---------------------------------------------------------------------------
+# 2. DATA DOWNLOAD (Binance public API, paginated, cached)
+# ---------------------------------------------------------------------------
+def download_binance_klines(symbol=SYMBOL, interval=INTERVAL, days_back=DAYS_BACK):
+    """
+    Downloads `days_back` days of historical klines from Binance's public
+    REST API (no API key needed) and returns a clean OHLCV DataFrame.
+    Paginates in chunks of MAX_LIMIT candles, respecting rate limits.
+    """
+    end_time = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_time = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp() * 1000)
+
+    all_rows = []
+    cur_start = start_time
+    session = requests.Session()
+    request_count = 0
+
+    print(f"[data] Downloading {days_back}d of {interval} {symbol} klines from Binance...")
+
+    while cur_start < end_time:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cur_start,
+            "limit": MAX_LIMIT,
+        }
+        for attempt in range(5):
+            try:
+                resp = session.get(BINANCE_KLINES_URL, params=params, timeout=15)
+                if resp.status_code == 200:
+                    break
+                elif resp.status_code == 429:
+                    wait = 5 * (attempt + 1)
+                    print(f"[data] Rate limited, waiting {wait}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"[data] HTTP {resp.status_code}: {resp.text[:200]}")
+                    time.sleep(2)
+            except requests.exceptions.RequestException as e:
+                print(f"[data] Request error: {e}, retrying...")
+                time.sleep(3)
+        else:
+            raise RuntimeError("Failed to fetch klines after multiple retries.")
+
+        batch = resp.json()
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        last_open_time = batch[-1][0]
+        cur_start = last_open_time + 1  # next page starts right after last candle
+        request_count += 1
+
+        if request_count % 20 == 0:
+            pct = min(100.0, (cur_start - start_time) / (end_time - start_time) * 100)
+            print(f"[data] ...{len(all_rows):,} candles fetched ({pct:.1f}%)")
+
+        # Be polite to the API (well under the 1200 req/min weight limit)
+        time.sleep(0.05)
+
+        if len(batch) < MAX_LIMIT:
+            # short batch usually means we've caught up to "now"
+            if cur_start >= end_time:
+                break
+
+    print(f"[data] Download complete: {len(all_rows):,} candles.")
+
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "num_trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ]
+    df = pd.DataFrame(all_rows, columns=cols)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+
+    df = df[["open_time", "open", "high", "low", "close", "volume", "close_time"]]
+    df = df.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
+    return df
+
+
+def load_data(refresh=False):
+    if (not refresh) and os.path.exists(CACHE_FILE):
+        print(f"[data] Loading cached data from {CACHE_FILE}")
+        df = pd.read_csv(CACHE_FILE, parse_dates=["open_time", "close_time"])
+        age_days = (datetime.now(timezone.utc) - df["open_time"].max().tz_convert("UTC")).total_seconds() / 86400
+        print(f"[data] Cached data spans {df['open_time'].min()} -> {df['open_time'].max()} "
+              f"({len(df):,} rows, newest candle is {age_days:.1f} days old)")
+        return df
+
+    df = download_binance_klines()
+    df.to_csv(CACHE_FILE, index=False)
+    print(f"[data] Saved cache to {CACHE_FILE}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 3. INDICATORS
+# ---------------------------------------------------------------------------
+def compute_rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    """Classic Wilder RSI."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss != 0, 100.0)          # no losses -> RSI 100
+    rsi = rsi.where(~((avg_gain == 0) & (avg_loss == 0)), 50.0)  # flat -> 50
+    return rsi
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["rsi"] = compute_rsi(df["close"], RSI_LEN)
+    df["rsi_ema"] = df["rsi"].ewm(span=EMA_LEN, adjust=False).mean()
+    return df
+
+
+# ---------------------------------------------------------------------------
+# 4. BACKTEST ENGINE
+# ---------------------------------------------------------------------------
+def run_backtest(df: pd.DataFrame, execution_mode: str = "close"):
+    """
+    execution_mode:
+      'close' -> enter at the close of the signal candle (the candle where
+                 the crossover is confirmed). Simpler, but technically
+                 assumes you can transact exactly at the closing price.
+      'next'  -> enter at the OPEN of the candle AFTER the signal candle.
+                 More realistic (no lookahead), since the signal candle's
+                 close isn't known until it closes.
+
+    Rules (long only):
+      - Signal: rsi crosses above rsi_ema on the signal candle (rsi[i-1] <= ema[i-1]
+        and rsi[i] > ema[i]).
+      - Entry price: signal candle close ('close' mode) or next candle open ('next' mode).
+      - Stop loss: low of the candle immediately BEFORE the signal candle (index i-1).
+      - Take profit: entry + 2.2 * (entry - stop_loss).
+      - Only one position open at a time (no pyramiding/overlapping trades).
+      - Exit check uses high/low of subsequent candles; if both TP and SL are
+        touched within the same candle, SL is assumed hit first (conservative).
+      - Round trip cost (0.06%) deducted from gross trade return.
+      - Position size = 100% of current equity (full compounding, spot-style,
+        no leverage).
+    """
+    n = len(df)
+    rsi = df["rsi"].values
+    ema = df["rsi_ema"].values
+    high = df["high"].values
+    low = df["low"].values
+    close = df["close"].values
+    openp = df["open"].values
+    times = df["open_time"].values
+
+    trades = []
+    equity = STARTING_EQUITY
+    equity_curve = [(times[0], equity)]
+
+    in_position = False
+    i = max(RSI_LEN, EMA_LEN) + 2  # warmup
+
+    while i < n - 1:
+        if not in_position:
+            # crossover check: rsi was <= ema, now > ema
+            if (not np.isnan(rsi[i - 1])) and (not np.isnan(ema[i - 1])) and \
+               (not np.isnan(rsi[i])) and (not np.isnan(ema[i])):
+                crossed_up = (rsi[i - 1] <= ema[i - 1]) and (rsi[i] > ema[i])
             else:
-                lvl0 = raw.columns.get_level_values(0).unique()
-                result = {sym: raw[sym] for sym in watchlist if sym in lvl0}
+                crossed_up = False
 
-            log.info(f"Download OK (attempt {attempt}): {len(result)} symbols")
-            return result
+            if crossed_up:
+                signal_idx = i
+                sl_price = low[signal_idx - 1]  # previous (trigger-1) candle low
 
-        except Exception as e:
-            log.warning(f"Download attempt {attempt}/{MAX_RETRIES} failed: {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
+                if execution_mode == "close":
+                    entry_idx = signal_idx
+                    entry_price = close[signal_idx]
+                else:  # 'next'
+                    entry_idx = signal_idx + 1
+                    if entry_idx >= n:
+                        break
+                    entry_price = openp[entry_idx]
 
-    log.error("All download attempts failed.")
-    return None
+                risk = entry_price - sl_price
+                if risk <= 0:
+                    # invalid setup (SL above/at entry) -> skip this signal
+                    i += 1
+                    continue
+
+                tp_price = entry_price + RR_MULTIPLE * risk
+
+                # walk forward from the bar after entry to find exit
+                exit_idx = None
+                exit_price = None
+                exit_reason = None
+                j = entry_idx + 1
+                while j < n:
+                    hit_sl = low[j] <= sl_price
+                    hit_tp = high[j] >= tp_price
+                    if hit_sl and hit_tp:
+                        # conservative assumption: SL hit first
+                        exit_idx, exit_price, exit_reason = j, sl_price, "SL"
+                        break
+                    elif hit_sl:
+                        exit_idx, exit_price, exit_reason = j, sl_price, "SL"
+                        break
+                    elif hit_tp:
+                        exit_idx, exit_price, exit_reason = j, tp_price, "TP"
+                        break
+                    j += 1
+
+                if exit_idx is None:
+                    # ran out of data before resolving -> close at last available price
+                    exit_idx = n - 1
+                    exit_price = close[exit_idx]
+                    exit_reason = "EOD_FORCE_CLOSE"
+
+                gross_ret = (exit_price - entry_price) / entry_price
+                net_ret = gross_ret - ROUND_TRIP_COST_PCT  # full round-trip cost on the trade
+
+                pnl_dollars = equity * net_ret
+                equity_before = equity
+                equity = equity + pnl_dollars
+
+                trades.append({
+                    "signal_time": times[signal_idx],
+                    "entry_time": times[entry_idx],
+                    "exit_time": times[exit_idx],
+                    "entry_price": entry_price,
+                    "sl_price": sl_price,
+                    "tp_price": tp_price,
+                    "exit_price": exit_price,
+                    "exit_reason": exit_reason,
+                    "risk_pct": risk / entry_price,
+                    "gross_return_pct": gross_ret,
+                    "net_return_pct": net_ret,
+                    "equity_before": equity_before,
+                    "equity_after": equity,
+                    "pnl_dollars": pnl_dollars,
+                    "bars_held": exit_idx - entry_idx,
+                })
+                equity_curve.append((times[exit_idx], equity))
+
+                i = exit_idx + 1  # no overlapping trades
+                continue
+        i += 1
+
+    trades_df = pd.DataFrame(trades)
+    equity_df = pd.DataFrame(equity_curve, columns=["time", "equity"])
+    return trades_df, equity_df
 
 
-# ─────────────────────────── SIGNAL CHECK ───────────────────────
-
-def check_crossover(symbol: str, df: pd.DataFrame,
-                    tf: str) -> tuple[str, str] | None:
-    """
-    Returns (alert_line, 'bull'|'bear') on a fresh crossover, else None.
-    Checks both bullish AND bearish crossovers.
-    """
-    if df.empty or len(df) < (RSI_PERIOD + WMA_PERIOD + 2):
-        return None
-
-    rsi     = ta.rsi(df['Close'], length=RSI_PERIOD)
-    wma_rsi = ta.wma(rsi,         length=WMA_PERIOD)
-
-    # Only keep last 2 valid rows — avoids holding full series in memory
-    valid = pd.DataFrame({'RSI': rsi, 'WMA': wma_rsi}).dropna().tail(2)
-    if len(valid) < 2:
-        return None
-
-    prev, curr = valid.iloc[-2], valid.iloc[-1]
-    last_close = df['Close'].iloc[-1]
-    now        = datetime.now()
-
-    def _fresh(key: str) -> bool:
-        return key not in last_alerts or (now - last_alerts[key]) > timedelta(hours=20)
-
-    # Bullish
-    if prev['RSI'] <= prev['WMA'] and curr['RSI'] > curr['WMA']:
-        key = f"{symbol}_{tf}_bull"
-        if _fresh(key):
-            last_alerts[key] = now
-            return (f"  🟢 `{symbol}` — RSI {curr['RSI']:.2f} | ₹{last_close:.2f}", 'bull')
-
-    # Bearish
-    if prev['RSI'] >= prev['WMA'] and curr['RSI'] < curr['WMA']:
-        key = f"{symbol}_{tf}_bear"
-        if _fresh(key):
-            last_alerts[key] = now
-            return (f"  🔴 `{symbol}` — RSI {curr['RSI']:.2f} | ₹{last_close:.2f}", 'bear')
-
-    return None
+# ---------------------------------------------------------------------------
+# 5. METRICS
+# ---------------------------------------------------------------------------
+def max_drawdown(equity_series: pd.Series):
+    running_max = equity_series.cummax()
+    dd = (equity_series - running_max) / running_max
+    return dd.min(), dd.idxmin()
 
 
-# ─────────────────────────── MAIN SCAN ──────────────────────────
+def compute_metrics(trades_df: pd.DataFrame, equity_df: pd.DataFrame, starting_equity: float):
+    if trades_df.empty:
+        print("No trades were generated. Try a longer period or check the data.")
+        return {}
 
-def run_bulk_scan() -> None:
-    global daily_summary, last_heartbeat
+    n_trades = len(trades_df)
+    wins = trades_df[trades_df["net_return_pct"] > 0]
+    losses = trades_df[trades_df["net_return_pct"] <= 0]
 
-    watchlist = load_watchlist()
-    log.info(f"Scan started — {len(watchlist)} symbols | timeframes: {TIMEFRAMES}")
-    time.sleep(random.randint(2, 5))
+    n_wins = len(wins)
+    n_losses = len(losses)
+    win_rate = n_wins / n_trades * 100
 
-    raw = download_with_retry(watchlist)
-    if raw is None:
-        send_telegram("⚠️ *Scanner*: Data download failed after 3 retries. Scan skipped.")
+    final_equity = equity_df["equity"].iloc[-1]
+    total_pnl_dollars = final_equity - starting_equity
+    total_return_pct = (final_equity / starting_equity - 1) * 100
+
+    avg_win_pct = wins["net_return_pct"].mean() * 100 if n_wins > 0 else 0.0
+    avg_loss_pct = losses["net_return_pct"].mean() * 100 if n_losses > 0 else 0.0
+    avg_win_dollars = wins["pnl_dollars"].mean() if n_wins > 0 else 0.0
+    avg_loss_dollars = losses["pnl_dollars"].mean() if n_losses > 0 else 0.0
+
+    gross_profit = wins["pnl_dollars"].sum() if n_wins > 0 else 0.0
+    gross_loss = -losses["pnl_dollars"].sum() if n_losses > 0 else 0.0
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else np.inf
+
+    # Expectancy (EV) per trade, in % return terms and in $ terms
+    ev_pct = (win_rate / 100 * avg_win_pct) + ((1 - win_rate / 100) * avg_loss_pct)
+    ev_dollars = trades_df["pnl_dollars"].mean()
+
+    # average R multiple actually achieved (using each trade's own risk)
+    trades_df = trades_df.copy()
+    trades_df["r_multiple"] = trades_df["net_return_pct"] / trades_df["risk_pct"].replace(0, np.nan)
+    avg_r = trades_df["r_multiple"].mean()
+    expectancy_r = (win_rate / 100) * RR_MULTIPLE - (1 - win_rate / 100) * 1  # theoretical R-based EV
+
+    largest_win = trades_df["pnl_dollars"].max()
+    largest_loss = trades_df["pnl_dollars"].min()
+
+    max_dd_pct, max_dd_time_idx = max_drawdown(equity_df["equity"])
+    max_dd_time = equity_df.loc[max_dd_time_idx, "time"] if not equity_df.empty else None
+
+    # Consecutive wins/losses
+    streak = (trades_df["net_return_pct"] > 0).astype(int)
+    max_consec_win = max_consec_loss = cur_win = cur_loss = 0
+    for v in streak:
+        if v == 1:
+            cur_win += 1; cur_loss = 0
+            max_consec_win = max(max_consec_win, cur_win)
+        else:
+            cur_loss += 1; cur_win = 0
+            max_consec_loss = max(max_consec_loss, cur_loss)
+
+    avg_bars_held = trades_df["bars_held"].mean()
+
+    # Sharpe-like ratio on per-trade returns (not annualized to a clean period
+    # since trade frequency is irregular; shown as per-trade Sharpe)
+    ret_std = trades_df["net_return_pct"].std()
+    sharpe_per_trade = trades_df["net_return_pct"].mean() / ret_std if ret_std > 0 else np.nan
+
+    # CAGR based on actual elapsed time of the data
+    start_time = equity_df["time"].iloc[0]
+    end_time = equity_df["time"].iloc[-1]
+    elapsed_days = (pd.to_datetime(end_time) - pd.to_datetime(start_time)).total_seconds() / 86400
+    elapsed_years = elapsed_days / 365.25 if elapsed_days > 0 else np.nan
+    cagr = ((final_equity / starting_equity) ** (1 / elapsed_years) - 1) * 100 if elapsed_years and elapsed_years > 0 else np.nan
+
+    metrics = {
+        "Total trades": n_trades,
+        "Winning trades": n_wins,
+        "Losing trades": n_losses,
+        "Win rate (%)": win_rate,
+        "Starting equity ($)": starting_equity,
+        "Final equity ($)": final_equity,
+        "Total P&L ($)": total_pnl_dollars,
+        "Total return (%)": total_return_pct,
+        "CAGR (%) [approx, compounding]": cagr,
+        "Avg win (%)": avg_win_pct,
+        "Avg loss (%)": avg_loss_pct,
+        "Avg win ($, at time of trade)": avg_win_dollars,
+        "Avg loss ($, at time of trade)": avg_loss_dollars,
+        "Largest win ($)": largest_win,
+        "Largest loss ($)": largest_loss,
+        "Gross profit ($, sum of winning trades)": gross_profit,
+        "Gross loss ($, sum of losing trades)": gross_loss,
+        "Profit factor": profit_factor,
+        "Expectancy / EV per trade (%)": ev_pct,
+        "Expectancy / EV per trade ($, at time of trade)": ev_dollars,
+        "Theoretical R-based expectancy (R per trade)": expectancy_r,
+        "Avg realized R-multiple per trade": avg_r,
+        "Max drawdown (%)": max_dd_pct * 100,
+        "Max drawdown date": max_dd_time,
+        "Max consecutive wins": max_consec_win,
+        "Max consecutive losses": max_consec_loss,
+        "Avg bars held (minutes)": avg_bars_held,
+        "Per-trade Sharpe (mean/std of trade returns)": sharpe_per_trade,
+        "Exit reason breakdown": trades_df["exit_reason"].value_counts().to_dict(),
+    }
+    return metrics
+
+
+def print_report(metrics: dict):
+    print("\n" + "=" * 70)
+    print(" BACKTEST RESULTS: SOLUSDC 1m | RSI(28)/EMA(13) crossover | Long-only")
+    print("=" * 70)
+    for k, v in metrics.items():
+        if isinstance(v, float):
+            print(f"{k:<55}: {v:,.4f}")
+        else:
+            print(f"{k:<55}: {v}")
+    print("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# 6. MAIN
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="SOLUSDC RSI/EMA crossover backtest")
+    parser.add_argument("--refresh", action="store_true", help="Force re-download data, ignore cache")
+    parser.add_argument("--execution", choices=["close", "next"], default="close",
+                         help="Entry execution mode: 'close' of signal candle or 'next' candle open")
+    args = parser.parse_args()
+
+    print("\n*** IMPORTANT: position sizing = 100% of current equity per trade ***")
+    print("*** (full compounding, no leverage, spot-style, one trade at a time) ***")
+    print("*** This is what you asked for, but note it means a single bad trade")
+    print("*** can wipe out a large fraction of the account. Review results")
+    print("*** carefully before considering this for real capital. ***\n")
+
+    df = load_data(refresh=args.refresh)
+    df = add_indicators(df)
+
+    trades_df, equity_df = run_backtest(df, execution_mode=args.execution)
+
+    if trades_df.empty:
+        print("No trades generated.")
         return
 
-    # Collect hits: hits[tf] = {'bull': [...lines], 'bear': [...lines]}
-    hits: dict[str, dict[str, list[str]]] = {
-        tf: {'bull': [], 'bear': []} for tf in TIMEFRAMES
-    }
-    scanned = 0
+    metrics = compute_metrics(trades_df, equity_df, STARTING_EQUITY)
+    print_report(metrics)
 
-    for symbol in watchlist:
-        try:
-            ticker_df = raw.get(symbol)
-            if ticker_df is None or ticker_df.empty:
-                continue
-            ticker_df = ticker_df.dropna(how='all')
-            scanned += 1
+    out_trades = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades_log.csv")
+    trades_df.to_csv(out_trades, index=False)
+    print(f"\nFull trade log saved to: {out_trades}")
 
-            for tf in TIMEFRAMES:
-                if tf == '1h':
-                    work_df = ticker_df
-                else:
-                    rule = RESAMPLE_MAP.get(tf)
-                    if not rule:
-                        continue
-                    # closed/label='left' avoids partial-candle edge issues
-                    work_df = (
-                        ticker_df
-                        .resample(rule, closed='left', label='left')
-                        .agg(AGGS)
-                        .dropna()
-                    )
+    out_equity = os.path.join(os.path.dirname(os.path.abspath(__file__)), "equity_curve.csv")
+    equity_df.to_csv(out_equity, index=False)
+    print(f"Equity curve saved to: {out_equity}")
 
-                result = check_crossover(symbol, work_df, tf)
-                if result:
-                    line, kind = result
-                    hits[tf][kind].append(line)
-                    tag = "✅" if kind == 'bull' else "🔻"
-                    daily_summary.append(
-                        f"{tag} {symbol} ({tf}) [{kind.upper()}] @ ₹{ticker_df['Close'].iloc[-1]:.2f}"
-                    )
-
-                if tf != '1h':
-                    del work_df
-
-        except Exception as e:
-            log.warning(f"Error processing {symbol}: {e}")
-            continue
-        finally:
-            try:
-                del ticker_df
-            except NameError:
-                pass
-
-    # Free bulk download immediately
-    del raw
-    gc.collect()
-
-    # ── ONE message per timeframe ──
-    total_hits = 0
-    for tf in TIMEFRAMES:
-        bull_lines = hits[tf]['bull']
-        bear_lines = hits[tf]['bear']
-        n = len(bull_lines) + len(bear_lines)
-        total_hits += n
-
-        if n == 0:
-            continue
-
-        sections = []
-        if bull_lines:
-            sections.append("*📈 Bullish Crossovers:*\n" + "\n".join(bull_lines))
-        if bear_lines:
-            sections.append("*📉 Bearish Crossovers:*\n" + "\n".join(bear_lines))
-
-        msg = (
-            f"🔔 *CROSSOVER ALERT — {tf.upper()}*\n"
-            f"_Scanned {scanned} symbols · {n} signal(s)_\n\n"
-            + "\n\n".join(sections)
-        )
-        send_telegram(msg)
-        log.info(f"Alert sent [{tf}]: {len(bull_lines)} bull, {len(bear_lines)} bear")
-
-    # ── Heartbeat every 3 h when nothing fires ──
-    now = datetime.now()
-    if total_hits == 0 and (now - last_heartbeat) >= timedelta(hours=3):
-        send_telegram(
-            f"✅ *Scanner Heartbeat*\n"
-            f"_Scanned {scanned} symbols across {', '.join(TIMEFRAMES)} — no signals this window._"
-        )
-        last_heartbeat = now
-        log.info("Heartbeat sent.")
-
-    prune_old_alerts()
-    log.info(f"Scan complete — {scanned} scanned, {total_hits} total hits.")
-
-
-def send_daily_report() -> None:
-    global daily_summary
-    if daily_summary:
-        report = "📊 *DAILY SIGNAL SUMMARY*\n\n" + "\n".join(daily_summary)
-    else:
-        report = "📊 *Daily Summary*\n_No signals fired today._"
-    send_telegram(report)
-    daily_summary.clear()
-    log.info("Daily report sent.")
-
-
-# ─────────────────────────── MAIN LOOP ──────────────────────────
 
 if __name__ == "__main__":
-    tz = pytz.timezone('Asia/Kolkata')
-    report_sent_today = False
-
-    log.info("=== Scanner started ===")
-    send_telegram(
-        "🟢 *Scanner Online*\n"
-        "📅 Schedule: " + "  |  ".join(SCAN_TIMES)
-    )
-
-    while True:
-        now       = datetime.now(tz)
-        is_market = (
-            now.weekday() < 5 and
-            datetime.strptime("09:15", "%H:%M").time()
-            <= now.time() <=
-            datetime.strptime("15:30", "%H:%M").time()
-        )
-
-        if is_market:
-            report_sent_today = False
-            next_scan = get_next_scan_time(tz)
-            wait_sec  = max(0, (next_scan - now).total_seconds())
-
-            if wait_sec > 0:
-                log.info(f"Next scan at {next_scan.strftime('%H:%M')} — waiting {wait_sec:.0f}s")
-                time.sleep(wait_sec)
-
-            run_bulk_scan()
-
-        else:
-            # Post-market: send daily report once per day
-            if not report_sent_today and now.weekday() < 5:
-                send_daily_report()
-                report_sent_today = True
-
-            next_scan = get_next_scan_time(tz)
-            wait_sec  = (next_scan - datetime.now(tz)).total_seconds()
-            log.info(
-                f"Market closed. Next scan {next_scan.strftime('%d-%b %H:%M')} "
-                f"— sleeping {wait_sec / 3600:.1f}h"
-            )
-            time.sleep(max(wait_sec, 60))
+    main()
